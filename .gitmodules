@@ -1,0 +1,3 @@
+[submodule "dependencies/mlx90640-library"]
+	path = dependencies/mlx90640-library
+	url = git@github.com:melexis/mlx90640-library.git

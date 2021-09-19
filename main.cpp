@@ -17,6 +17,14 @@
 using namespace pimoroni;
 #define CAM_ON
 
+struct Color {
+    constexpr Color(uint8_t r, uint8_t g, uint8_t b) : r(r), g(g), b(b) {}
+    
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+};
+
 // --- CONSTANTS
 // I2C
 constexpr uint I2CBaudRate = 1000 * 1000; // Will break ThermalCameraFrameDurationUs if not 1 MHz
@@ -41,6 +49,8 @@ constexpr int32_t HeatmapTopOffsetPixels = 3;
 constexpr int32_t TextXOffset = NearestScaleMult * TemperatureSensorWidth + 4;
 constexpr int32_t TextYOffset = HeatmapTopOffsetPixels;
 
+constexpr float HeatmapDeltaMultiplier = 0.000002f;
+
 struct ShortColor3 {
     constexpr ShortColor3(int16_t r, int16_t g, int16_t b) : r(r), g(g), b(b) {}
     
@@ -58,6 +68,7 @@ constexpr std::array<ShortColor3, 7> HeatmapColors = {
     ShortColor3(255,   0, 255),
     ShortColor3(255, 255, 255),
 };
+constexpr size_t lastColorID = HeatmapColors.size() - 1;
 
 // ADC/Battery
 constexpr float BatteryConversionFactor = 3 * 3.3f / (1 << 12);
@@ -73,8 +84,10 @@ const std::string UsbConnectedTxt   = "USB Power";
 const std::string UsbDiconnectedTxt = "Battery Power";
 
 // UI
-const std::string HoldX = "Hold X - Mark Min";
-const std::string HoldY = "Hold Y - Mark Max";
+const std::string HoldX =  "Hold X - Mark Min (White)";
+const std::string HoldY =  "Hold Y - Mark Max (Black)";
+const std::string PressA = "Hold A + X|Y - Heatmap Min";
+const std::string PressB = "Hold B + X|Y - Heatmap Max";
 
 // --- CONSTANTS END
 
@@ -113,6 +126,35 @@ void CrashWithError(const char* error, int errorCode) {
         display.update();
         sleep_ms(500);
     }
+}
+
+inline Color TemperatureToHeatmap(float value, const float heatmapRange, PicoDisplay& display) {
+    value -= heatmapMin;
+    value /= heatmapRange;
+    
+    float lerpDist = 0;
+    
+    size_t p0ID;
+    size_t p1ID;
+    if (value <= 0) {
+        p0ID = 0;
+        p1ID = 0;
+    } else if (value >= 1) {
+        p0ID = lastColorID;
+        p1ID = lastColorID;
+    } else {
+        value *= lastColorID;
+        p0ID = std::floor(value);
+        p1ID = p0ID + 1;
+        
+        lerpDist = value - static_cast<float>(p0ID);
+    }
+    
+    const uint8_t r = ((HeatmapColors[p1ID].r - HeatmapColors[p0ID].r) * lerpDist) + HeatmapColors[p0ID].r;
+    const uint8_t g = ((HeatmapColors[p1ID].g - HeatmapColors[p0ID].g) * lerpDist) + HeatmapColors[p0ID].g;
+    const uint8_t b = ((HeatmapColors[p1ID].b - HeatmapColors[p0ID].b) * lerpDist) + HeatmapColors[p0ID].b;
+    
+    return Color(r, g, b);
 }
 
 int main() {
@@ -209,8 +251,26 @@ int main() {
     int64_t lastSleepDuration = 0;
     uint64_t iter = 0;
     
+    bool xPressed = false;
+    bool yPressed = false;
+    bool aPressed = false;
+    bool bPressed = false;
+    
+    bool xPressedLastTime = false;
+    bool yPressedLastTime = false;
+    bool aPressedLastTime = false;
+    bool bPressedLastTime = false;
+    
+    absolute_time_t previous = get_absolute_time();
     while (true) {
         const absolute_time_t start = get_absolute_time();
+        const int64_t deltaFrame = absolute_time_diff_us(start, previous);
+        previous = start;
+        
+        xPressed = display.is_pressed(PicoDisplay::X);
+        yPressed = display.is_pressed(PicoDisplay::Y);
+        aPressed = display.is_pressed(PicoDisplay::A);
+        bPressed = display.is_pressed(PicoDisplay::B);
         
         display.set_pen(120, 40, 60);
         display.clear();
@@ -247,7 +307,6 @@ int main() {
         MLX90640_BadPixelsCorrection((&mlx90640Params)->outlierPixels, finalTemperatureData.data(), 1, &mlx90640Params);
         
         const float heatmapRange = heatmapMax - heatmapMin;
-        constexpr size_t lastColorID = HeatmapColors.size() - 1;
         
         float minTemp = FLT_MAX;
         Point minTempPixel;
@@ -255,9 +314,25 @@ int main() {
         float maxTemp = -FLT_MIN;
         Point maxTempPixel;
         
+        if (!(aPressed && bPressed)) {
+            if (aPressed && xPressed) {
+                heatmapMin += HeatmapDeltaMultiplier * deltaFrame;
+            } else if (aPressed && yPressed) {
+                heatmapMin -= HeatmapDeltaMultiplier * deltaFrame;
+            }
+            
+            if (bPressed && xPressed) {
+                heatmapMax += HeatmapDeltaMultiplier * deltaFrame;
+            } else if (bPressed && yPressed) {
+                heatmapMax -= HeatmapDeltaMultiplier * deltaFrame;
+            }
+        }
+        
+        float temperatureSum = 0.0f;
         for (size_t x = 0; x < TemperatureSensorWidth; ++x) {
             for (size_t y = 0; y < TemperatureSensorHeight; ++y) {
                 float value = finalTemperatureData[TemperatureSensorHeight * (TemperatureSensorWidth - 1 - x) + y];
+                temperatureSum += value;
                 
                 if (value < minTemp) {
                     minTemp = value;
@@ -269,41 +344,24 @@ int main() {
                     maxTempPixel = Point(x, y);
                 }
                 
-                value -= heatmapMin;
-                value /= heatmapRange;
-                
-                float lerpDist = 0;
-                
-                size_t p0ID;
-                size_t p1ID;
-                if (value <= 0) {
-                    p0ID = 0;
-                    p1ID = 0;
-                } else if (value >= 1) {
-                    p0ID = lastColorID;
-                    p1ID = lastColorID;
-                } else {
-                    value *= lastColorID;
-                    p0ID = std::floor(value);
-                    p1ID = p0ID + 1;
-                    
-                    lerpDist = value - static_cast<float>(p0ID);
-                }
-                
-                const uint8_t r = ((HeatmapColors[p1ID].r - HeatmapColors[p0ID].r) * lerpDist) + HeatmapColors[p0ID].r;
-                const uint8_t g = ((HeatmapColors[p1ID].g - HeatmapColors[p0ID].g) * lerpDist) + HeatmapColors[p0ID].g;
-                const uint8_t b = ((HeatmapColors[p1ID].b - HeatmapColors[p0ID].b) * lerpDist) + HeatmapColors[p0ID].b;
-                
-                heatmapPixels[y * TemperatureSensorWidth + x] = display.create_pen(r, g, b);
+                const Color color = TemperatureToHeatmap(value, heatmapRange, display);
+                heatmapPixels[y * TemperatureSensorWidth + x] = display.create_pen(color.r, color.g, color.b);
             }
         }
         
-        if (display.is_pressed(PicoDisplay::X)) {
-            heatmapPixels[minTempPixel.y * TemperatureSensorWidth + minTempPixel.x] = blackPen;
+        const float temperatureAverage = temperatureSum / FinalTemperatureDataSize;
+        const Color avgColor = TemperatureToHeatmap(temperatureAverage, heatmapRange, display);
+        
+        // Full brightness LED is blinding in a dark room and makes looking at the screen painful
+        constexpr uint8_t brightnessDivisor = 3;
+        display.set_led(avgColor.r / brightnessDivisor, avgColor.g / brightnessDivisor, avgColor.b / brightnessDivisor);
+        
+        if (xPressed && !(aPressed || bPressed)) {
+            heatmapPixels[minTempPixel.y * TemperatureSensorWidth + minTempPixel.x] = whitePen;
         }
 
-        if (display.is_pressed(PicoDisplay::Y)) {
-            heatmapPixels[maxTempPixel.y * TemperatureSensorWidth + maxTempPixel.x] = whitePen;
+        if (yPressed && !(aPressed || bPressed)) {
+            heatmapPixels[maxTempPixel.y * TemperatureSensorWidth + maxTempPixel.x] = blackPen;
         }
 
         
@@ -322,12 +380,12 @@ int main() {
         int32_t infoYOffset = USBTextOrigin.y + TextLineHeight * 2;
         
         char minValText[64];
-        sprintf(minValText, "MIN: %.2fC", minTemp);
+        sprintf(minValText, "Min: %.2fC", minTemp);
         display.text(minValText, Point(TextXOffset, infoYOffset), 255, 1);
         infoYOffset += TextLineHeight;
         
         char minValTextPixel[64];
-        sprintf(minValTextPixel, "MIN PX: %d %d", minTempPixel.x, minTempPixel.y);
+        sprintf(minValTextPixel, "Min Pixel: %d %d", minTempPixel.x, minTempPixel.y);
         display.text(minValTextPixel, Point(TextXOffset, infoYOffset), 255, 1);
         infoYOffset += TextLineHeight;
         display.text(HoldX, Point(TextXOffset, infoYOffset), 255, 1);
@@ -339,18 +397,42 @@ int main() {
         infoYOffset += TextLineHeight;
         
         char maxValTextPixel[64];
-        sprintf(maxValTextPixel, "MAX PX: %d %d", maxTempPixel.x, maxTempPixel.y);
+        sprintf(maxValTextPixel, "Max Pixel: %d %d", maxTempPixel.x, maxTempPixel.y);
         display.text(maxValTextPixel, Point(TextXOffset, infoYOffset), 255, 1);
         infoYOffset += TextLineHeight;
         display.text(HoldY, Point(TextXOffset, infoYOffset), 255, 1);
+        infoYOffset += TextLineHeight * 2;
+        
+        char avgText[64];
+        sprintf(avgText, "Avgerage (LED): %.2fC", temperatureAverage);
+        display.text(avgText, Point(TextXOffset, infoYOffset), 255, 1);
+        infoYOffset += TextLineHeight * 2;
+        
+        char heatmapMinText[64];
+        sprintf(heatmapMinText, "Heatmap Min: %.2f", heatmapMin);
+        display.text(heatmapMinText, Point(TextXOffset, infoYOffset), 255, 1);
+        infoYOffset += TextLineHeight;
+        display.text(PressA, Point(TextXOffset, infoYOffset), 255, 1);
+        infoYOffset += TextLineHeight * 2;
+        
+        char heatmapMaxText[64];
+        sprintf(heatmapMaxText, "Heatmap Max: %.2f", heatmapMax);
+        display.text(heatmapMaxText, Point(TextXOffset, infoYOffset), 255, 1);
+        infoYOffset += TextLineHeight;
+        display.text(PressB, Point(TextXOffset, infoYOffset), 255, 1);
         infoYOffset += TextLineHeight * 2;
 #endif // CAM_ON
 
         display.update();
         
+        xPressedLastTime = xPressed;
+        yPressedLastTime = yPressed;
+        aPressedLastTime = aPressed;
+        bPressedLastTime = bPressed;
+        
         const absolute_time_t end = get_absolute_time();
-        const int64_t deltaUs = absolute_time_diff_us(start, end);
-        lastSleepDuration = ThermalCameraFrameDurationUs - deltaUs;
+        const int64_t durationDeltaUs = absolute_time_diff_us(start, end);
+        lastSleepDuration = ThermalCameraFrameDurationUs - durationDeltaUs;
         if (lastSleepDuration > 0) {
             sleep_us(lastSleepDuration);
         } else {

@@ -11,23 +11,13 @@
 
 #include <sstream>
 #include <iomanip>
+#include <cmath>
+#include <cfloat>
 
 using namespace pimoroni;
 #define CAM_ON
 
 // --- CONSTANTS
-// ADC/Battery
-constexpr float BatteryConversionFactor = 3 * 3.3f / (1 << 12);
-constexpr uint8_t BatteryVoltagePin = 29;
-constexpr uint8_t ADCInputID = 3; // 0..3, which corresponds to pins 26..29
-const Point BatteryTextOrigin(0, 0);
-
-// USB
-constexpr uint8_t USBConnectedPin = 24;
-const Point USBTextOrigin(0, 7);
-const std::string usbConnected   = "USB Connected";
-const std::string usbDiconnected = "USB Disconnected";
-
 // I2C
 constexpr uint I2CBaudRate = 1000 * 1000; // Will break ThermalCameraFrameDurationUs if not 1 MHz
 
@@ -38,25 +28,68 @@ constexpr uint8_t ThermalCameraHeight = 32;
 constexpr uint8_t ThermalCameraFPS = 4;
 constexpr int64_t ThermalCameraFrameDurationUs = I2CBaudRate / ThermalCameraFPS;
 
-using ThermalCameraEEPROMDataType = uint16_t;
 constexpr size_t ThermalCameraEEPROMDataSize = 832;
-
-using ThermalCameraFrameDataType = uint16_t;
 constexpr size_t ThermalCameraFrameDataSize = 834;
 
-constexpr size_t FinalTemperatureDataSize = 768;
+constexpr int32_t TemperatureSensorWidth = 24;
+constexpr int32_t TemperatureSensorHeight = 32;
+constexpr int32_t FinalTemperatureDataSize = TemperatureSensorWidth * TemperatureSensorHeight;
+
+constexpr int32_t NearestScaleMult = 4;
+constexpr int32_t HeatmapTopOffsetPixels = 3;
+
+constexpr int32_t TextXOffset = NearestScaleMult * TemperatureSensorWidth + 4;
+constexpr int32_t TextYOffset = HeatmapTopOffsetPixels;
+
+struct ShortColor3 {
+    constexpr ShortColor3(int16_t r, int16_t g, int16_t b) : r(r), g(g), b(b) {}
+    
+    int16_t r;
+    int16_t g;
+    int16_t b;
+};
+
+constexpr std::array<ShortColor3, 7> HeatmapColors = {
+    ShortColor3(  0,   0,   0),
+    ShortColor3(  0,   0, 255),
+    ShortColor3(  0, 255,   0),
+    ShortColor3(255, 255,   0),
+    ShortColor3(255,   0,   0),
+    ShortColor3(255,   0, 255),
+    ShortColor3(255, 255, 255),
+};
+
+// ADC/Battery
+constexpr float BatteryConversionFactor = 3 * 3.3f / (1 << 12);
+constexpr uint8_t BatteryVoltagePin = 29;
+constexpr uint8_t ADCInputID = 3; // 0..3, which corresponds to pins 26..29
+const Point BatteryTextOrigin(TextXOffset, TextYOffset);
+
+// USB
+constexpr uint8_t USBConnectedPin = 24;
+constexpr int32_t TextLineHeight = 7;
+const Point USBTextOrigin(TextXOffset, TextLineHeight + TextYOffset);
+const std::string UsbConnectedTxt   = "USB Power";
+const std::string UsbDiconnectedTxt = "Battery Power";
+
+// UI
+const std::string HoldX = "Hold X - Mark Min";
+const std::string HoldY = "Hold Y - Mark Max";
 
 // --- CONSTANTS END
 
 // Globals
-uint16_t buffer[PicoDisplay::WIDTH * PicoDisplay::HEIGHT];
-PicoDisplay display(buffer);
+std::array<uint16_t, PicoDisplay::WIDTH * PicoDisplay::HEIGHT> displayBuffer;
+PicoDisplay display(displayBuffer.data());
 
-ThermalCameraEEPROMDataType cameraEEPROMData[ThermalCameraEEPROMDataSize];
-ThermalCameraFrameDataType cameraFrameData[ThermalCameraFrameDataSize];
-float finalTemperatureData[FinalTemperatureDataSize];
+std::array<uint16_t, ThermalCameraEEPROMDataSize> cameraEEPROMData;
+std::array<uint16_t, ThermalCameraFrameDataSize> cameraFrameData;
+std::array<float, FinalTemperatureDataSize> finalTemperatureData;
+std::array<Pen, FinalTemperatureDataSize> heatmapPixels;
 
 // TODO adjustable?
+float heatmapMin = 5;
+float heatmapMax = 50;
 float emissivity = 1;
 
 void CrashWithError(const char* error, int errorCode) {
@@ -146,14 +179,14 @@ int main() {
         CrashWithError("Failed to set the camera to chess mode", chessModeResult);
     }
     
-    const int eeDumpResult = MLX90640_DumpEE(ThermalCameraI2CAddress, cameraEEPROMData);
+    const int eeDumpResult = MLX90640_DumpEE(ThermalCameraI2CAddress, cameraEEPROMData.data());
     if (eeDumpResult != 0) {
         CrashWithError("Failed to dump camera eeprom data", eeDumpResult);
     }
     
     uint16_t hey = 64;
     printf("HEY: %d\n\n", hey);
-    for (size_t b = 0; b < ThermalCameraFrameDataSize; ++b) {
+    for (size_t b = 0; b < cameraFrameData.size(); ++b) {
         //printf("0x%04d ", cameraFrameData[b]);
         printf("%d", cameraFrameData[b]);
         
@@ -163,14 +196,19 @@ int main() {
     }
     
     paramsMLX90640 mlx90640Params;
-    const int paramExtractResult = MLX90640_ExtractParameters(cameraEEPROMData, &mlx90640Params);
+    const int paramExtractResult = MLX90640_ExtractParameters(cameraEEPROMData.data(), &mlx90640Params);
     if (paramExtractResult != 0) {
         CrashWithError("Problems when parsing camera eeprom data", paramExtractResult);
     }
 #endif // CAM_ON
+
+    const Pen textColor = display.create_pen(0, 255, 0);
+    const Pen whitePen = display.create_pen(255, 255, 255);
+    const Pen blackPen = display.create_pen(  0,   0,   0);
     
     int64_t lastSleepDuration = 0;
     uint64_t iter = 0;
+    
     while (true) {
         const absolute_time_t start = get_absolute_time();
         
@@ -180,33 +218,132 @@ int main() {
         const uint16_t rawADC = adc_read();
         const float voltage = static_cast<float>(rawADC) * BatteryConversionFactor;
         
-        display.set_pen(0, 255, 0);
+        display.set_pen(textColor);
         
         std::stringstream ss;
-        ss << std::fixed << std::setprecision(3) << voltage << "V; Sleep: " << lastSleepDuration << "us; Iter: " << iter;
+        ss << std::fixed << std::setprecision(3) << voltage << "V";
         iter++;
         
         const std::string voltageStr = ss.str();
         display.text(voltageStr, BatteryTextOrigin, 255, 1);
         
         if (gpio_get(USBConnectedPin)) {
-            display.text(usbConnected, USBTextOrigin, 255, 1);
+            display.text(UsbConnectedTxt, USBTextOrigin, 255, 1);
         } else {
-            display.text(usbDiconnected, USBTextOrigin, 255, 1);
+            display.text(UsbDiconnectedTxt, USBTextOrigin, 255, 1);
         }
         
 #ifdef CAM_ON
-        const int frameDataFetchResult = MLX90640_GetFrameData(ThermalCameraI2CAddress, cameraFrameData);
+        const int frameDataFetchResult = MLX90640_GetFrameData(ThermalCameraI2CAddress, cameraFrameData.data());
         if (frameDataFetchResult < 0) {
             display.update();
             CrashWithError("Failed to get the frame data", frameDataFetchResult);
         }
 
-        const float ta = MLX90640_GetTa(cameraFrameData, &mlx90640Params);
-        MLX90640_CalculateTo(cameraFrameData, &mlx90640Params, emissivity, ta, finalTemperatureData);
+        const float ta = MLX90640_GetTa(cameraFrameData.data(), &mlx90640Params);
+        MLX90640_CalculateTo(cameraFrameData.data(), &mlx90640Params, emissivity, ta, finalTemperatureData.data());
 
-        MLX90640_BadPixelsCorrection((&mlx90640Params)->brokenPixels, finalTemperatureData, 1, &mlx90640Params);
-        MLX90640_BadPixelsCorrection((&mlx90640Params)->outlierPixels, finalTemperatureData, 1, &mlx90640Params);
+        MLX90640_BadPixelsCorrection((&mlx90640Params)->brokenPixels, finalTemperatureData.data(), 1, &mlx90640Params);
+        MLX90640_BadPixelsCorrection((&mlx90640Params)->outlierPixels, finalTemperatureData.data(), 1, &mlx90640Params);
+        
+        const float heatmapRange = heatmapMax - heatmapMin;
+        constexpr size_t lastColorID = HeatmapColors.size() - 1;
+        
+        float minTemp = FLT_MAX;
+        Point minTempPixel;
+        
+        float maxTemp = -FLT_MIN;
+        Point maxTempPixel;
+        
+        for (size_t x = 0; x < TemperatureSensorWidth; ++x) {
+            for (size_t y = 0; y < TemperatureSensorHeight; ++y) {
+                float value = finalTemperatureData[TemperatureSensorHeight * (TemperatureSensorWidth - 1 - x) + y];
+                
+                if (value < minTemp) {
+                    minTemp = value;
+                    minTempPixel = Point(x, y);
+                }
+                
+                if (value > maxTemp) {
+                    maxTemp = value;
+                    maxTempPixel = Point(x, y);
+                }
+                
+                value -= heatmapMin;
+                value /= heatmapRange;
+                
+                float lerpDist = 0;
+                
+                size_t p0ID;
+                size_t p1ID;
+                if (value <= 0) {
+                    p0ID = 0;
+                    p1ID = 0;
+                } else if (value >= 1) {
+                    p0ID = lastColorID;
+                    p1ID = lastColorID;
+                } else {
+                    value *= lastColorID;
+                    p0ID = std::floor(value);
+                    p1ID = p0ID + 1;
+                    
+                    lerpDist = value - static_cast<float>(p0ID);
+                }
+                
+                const uint8_t r = ((HeatmapColors[p1ID].r - HeatmapColors[p0ID].r) * lerpDist) + HeatmapColors[p0ID].r;
+                const uint8_t g = ((HeatmapColors[p1ID].g - HeatmapColors[p0ID].g) * lerpDist) + HeatmapColors[p0ID].g;
+                const uint8_t b = ((HeatmapColors[p1ID].b - HeatmapColors[p0ID].b) * lerpDist) + HeatmapColors[p0ID].b;
+                
+                heatmapPixels[y * TemperatureSensorWidth + x] = display.create_pen(r, g, b);
+            }
+        }
+        
+        if (display.is_pressed(PicoDisplay::X)) {
+            heatmapPixels[minTempPixel.y * TemperatureSensorWidth + minTempPixel.x] = blackPen;
+        }
+
+        if (display.is_pressed(PicoDisplay::Y)) {
+            heatmapPixels[maxTempPixel.y * TemperatureSensorWidth + maxTempPixel.x] = whitePen;
+        }
+
+        
+        for (int32_t x = 0; x < TemperatureSensorWidth; ++x) {
+            for (int32_t y = 0; y < TemperatureSensorHeight; ++y) {
+                const Pen p = heatmapPixels[y * TemperatureSensorWidth + x];
+                
+                for (int32_t r = 0; r < NearestScaleMult; ++r) {
+                    display.set_pen(p);
+                    display.pixel_span(Point(x * NearestScaleMult, (y * NearestScaleMult) + HeatmapTopOffsetPixels + r), NearestScaleMult);
+                }
+            }
+        }
+        
+        display.set_pen(textColor);
+        int32_t infoYOffset = USBTextOrigin.y + TextLineHeight * 2;
+        
+        char minValText[64];
+        sprintf(minValText, "MIN: %.2fC", minTemp);
+        display.text(minValText, Point(TextXOffset, infoYOffset), 255, 1);
+        infoYOffset += TextLineHeight;
+        
+        char minValTextPixel[64];
+        sprintf(minValTextPixel, "MIN PX: %d %d", minTempPixel.x, minTempPixel.y);
+        display.text(minValTextPixel, Point(TextXOffset, infoYOffset), 255, 1);
+        infoYOffset += TextLineHeight;
+        display.text(HoldX, Point(TextXOffset, infoYOffset), 255, 1);
+        infoYOffset += TextLineHeight * 2;
+        
+        char maxValText[64];
+        sprintf(maxValText, "MAX: %.2fC", maxTemp);
+        display.text(maxValText, Point(TextXOffset, infoYOffset), 255, 1);
+        infoYOffset += TextLineHeight;
+        
+        char maxValTextPixel[64];
+        sprintf(maxValTextPixel, "MAX PX: %d %d", maxTempPixel.x, maxTempPixel.y);
+        display.text(maxValTextPixel, Point(TextXOffset, infoYOffset), 255, 1);
+        infoYOffset += TextLineHeight;
+        display.text(HoldY, Point(TextXOffset, infoYOffset), 255, 1);
+        infoYOffset += TextLineHeight * 2;
 #endif // CAM_ON
 
         display.update();

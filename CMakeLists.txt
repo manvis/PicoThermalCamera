@@ -6,6 +6,9 @@ project(thermalCam C CXX ASM)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
+# WAY too many warnings from the Pico SDK
+# set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -pedantic -fdiagnostics-color=always")
+
 pico_sdk_init()
 
 include(${PIMORONI_PICO_PATH}/libraries/pico_display/pico_display.cmake)

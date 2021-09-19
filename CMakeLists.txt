@@ -12,9 +12,13 @@ include(${PIMORONI_PICO_PATH}/libraries/pico_display/pico_display.cmake)
 
 add_executable(thermalCam
     main.cpp
+    MLX90640_I2C_PicoDriver.cpp
+    dependencies/mlx90640-library/functions/MLX90640_API.cpp
 )
+
+include_directories(dependencies/mlx90640-library/headers)
 
 pico_enable_stdio_usb(thermalCam 1)
 pico_enable_stdio_uart(thermalCam 1)
 pico_add_extra_outputs(thermalCam)
-target_link_libraries(thermalCam pico_stdlib hardware_spi hardware_pwm hardware_adc hardware_dma pico_display)
+target_link_libraries(thermalCam pico_stdlib hardware_spi hardware_pwm hardware_adc hardware_i2c hardware_dma pico_display)

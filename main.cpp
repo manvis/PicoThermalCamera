@@ -100,7 +100,6 @@ std::array<uint16_t, ThermalCameraFrameDataSize> cameraFrameData;
 std::array<float, FinalTemperatureDataSize> finalTemperatureData;
 std::array<Pen, FinalTemperatureDataSize> heatmapPixels;
 
-// TODO adjustable?
 float heatmapMin = 5;
 float heatmapMax = 50;
 float emissivity = 1;

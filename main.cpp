@@ -334,18 +334,20 @@ int main() {
                 float value = finalTemperatureData[TemperatureSensorHeight * (TemperatureSensorWidth - 1 - x) + y];
                 temperatureSum += value;
                 
+                const size_t outputX = TemperatureSensorWidth - 1 - x;
+                
                 if (value < minTemp) {
                     minTemp = value;
-                    minTempPixel = Point(x, y);
+                    minTempPixel = Point(outputX, y);
                 }
                 
                 if (value > maxTemp) {
                     maxTemp = value;
-                    maxTempPixel = Point(x, y);
+                    maxTempPixel = Point(outputX, y);
                 }
                 
                 const Color color = TemperatureToHeatmap(value, heatmapRange, display);
-                heatmapPixels[y * TemperatureSensorWidth + x] = display.create_pen(color.r, color.g, color.b);
+                heatmapPixels[y * TemperatureSensorWidth + outputX] = display.create_pen(color.r, color.g, color.b);
             }
         }
         

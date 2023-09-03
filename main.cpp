@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <cmath>
 #include <cfloat>
+#include <array>
 
 using namespace pimoroni;
 #define CAM_ON

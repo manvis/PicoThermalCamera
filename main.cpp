@@ -1,11 +1,15 @@
-#include <stdio.h>
-#include "pico/stdlib.h"
+#include <cstdio>
+#include <cstdlib>
 #include "hardware/gpio.h"
 #include "hardware/adc.h"
 #include "hardware/i2c.h"
 #include "pico/binary_info.h"
 
 #include "pico_display.hpp"
+#include "drivers/st7789/st7789.hpp"
+#include "libraries/pico_graphics/pico_graphics.hpp"
+#include "drivers/rgbled/rgbled.hpp"
+#include "drivers/button/button.hpp"
 
 #include "MLX90640_API.h"
 
@@ -34,7 +38,7 @@ constexpr uint I2CBaudRate = 1000 * 1000; // Will break ThermalCameraFrameDurati
 constexpr uint8_t ThermalCameraI2CAddress = 0x33;
 constexpr uint8_t ThermalCameraWidth = 24;
 constexpr uint8_t ThermalCameraHeight = 32;
-constexpr uint8_t ThermalCameraFPS = 4;
+constexpr uint8_t ThermalCameraFPS = 16;
 constexpr int64_t ThermalCameraFrameDurationUs = I2CBaudRate / ThermalCameraFPS;
 
 constexpr size_t ThermalCameraEEPROMDataSize = 832;
@@ -90,11 +94,26 @@ const std::string HoldY =  "Hold Y - Mark Max (Black)";
 const std::string PressA = "Hold A + X|Y - Heatmap Min";
 const std::string PressB = "Hold B + X|Y - Heatmap Max";
 
+struct DisplayState {
+    DisplayState() : graphics(PicoDisplay::WIDTH, PicoDisplay::HEIGHT, nullptr),
+        st7789(PicoDisplay::WIDTH, PicoDisplay::HEIGHT, ROTATE_0, false, get_spi_pins(BG_SPI_FRONT)),
+        buttonA(PicoDisplay::A), buttonB(PicoDisplay::B), buttonX(PicoDisplay::X), buttonY(PicoDisplay::Y),
+        led(PicoDisplay::LED_R, PicoDisplay::LED_G, PicoDisplay::LED_B) {}
+    
+    PicoGraphics_PenRGB565 graphics;
+    ST7789 st7789;
+
+    Button buttonA;
+    Button buttonB;
+    Button buttonX;
+    Button buttonY;
+
+    RGBLED led;
+};
+
 // --- CONSTANTS END
 
 // Globals
-std::array<uint16_t, PicoDisplay::WIDTH * PicoDisplay::HEIGHT> displayBuffer;
-PicoDisplay display(displayBuffer.data());
 
 std::array<uint16_t, ThermalCameraEEPROMDataSize> cameraEEPROMData;
 std::array<uint16_t, ThermalCameraFrameDataSize> cameraFrameData;
@@ -105,30 +124,32 @@ float heatmapMin = 5;
 float heatmapMax = 50;
 float emissivity = 1;
 
-void CrashWithError(const char* error, int errorCode) {
+[[noreturn]] void CrashWithError(DisplayState& displayState, const char* error, const int errorCode) {
     const Point errorMessageOrigin(0, 0);
     
     char buffer[512] = {};
     sprintf(buffer, "%s: %d", error, errorCode);
     
     const std::string errorString = buffer;
+    auto& graphics = displayState.graphics;
+    auto& st7789 = displayState.st7789;
     
     while (true) {
-        display.set_pen(255, 0, 0);
-        display.clear();
+        graphics.set_pen(255, 0, 0);
+        graphics.clear();
         
-        display.set_pen(0, 0, 255);
-        display.text(errorString, errorMessageOrigin, 255, 2);
+        graphics.set_pen(0, 0, 255);
+        graphics.text(errorString, errorMessageOrigin, 255, 2);
         
         printf(errorString.data());
         printf("\n");
         
-        display.update();
+        st7789.update(&graphics);
         sleep_ms(500);
     }
 }
 
-inline Color TemperatureToHeatmap(float value, const float heatmapRange, PicoDisplay& display) {
+inline Color TemperatureToHeatmap(float value, const float heatmapRange) {
     value -= heatmapMin;
     value /= heatmapRange;
     
@@ -150,14 +171,17 @@ inline Color TemperatureToHeatmap(float value, const float heatmapRange, PicoDis
         lerpDist = value - static_cast<float>(p0ID);
     }
     
-    const uint8_t r = ((HeatmapColors[p1ID].r - HeatmapColors[p0ID].r) * lerpDist) + HeatmapColors[p0ID].r;
-    const uint8_t g = ((HeatmapColors[p1ID].g - HeatmapColors[p0ID].g) * lerpDist) + HeatmapColors[p0ID].g;
-    const uint8_t b = ((HeatmapColors[p1ID].b - HeatmapColors[p0ID].b) * lerpDist) + HeatmapColors[p0ID].b;
+    const auto r = static_cast<uint8_t>((static_cast<float>(HeatmapColors[p1ID].r - HeatmapColors[p0ID].r) * lerpDist) +
+        static_cast<float>(HeatmapColors[p0ID].r));
+    const auto g = static_cast<uint8_t>((static_cast<float>(HeatmapColors[p1ID].g - HeatmapColors[p0ID].g) * lerpDist) +
+        static_cast<float>(HeatmapColors[p0ID].g));
+    const auto b = static_cast<uint8_t>((static_cast<float>(HeatmapColors[p1ID].b - HeatmapColors[p0ID].b) * lerpDist) +
+        static_cast<float>(HeatmapColors[p0ID].b));
     
-    return Color(r, g, b);
+    return {r, g, b};
 }
 
-int main() {
+[[noreturn]] int main() {
     bi_decl(bi_program_description("Pico Thermal Camera"));
     
     stdio_init_all();
@@ -176,17 +200,21 @@ int main() {
     
     gpio_pull_up(PICO_DEFAULT_I2C_SDA_PIN);
     gpio_pull_up(PICO_DEFAULT_I2C_SCL_PIN);
+
+    DisplayState displayState;
+    auto& st7789 = displayState.st7789;
+    auto& graphics = displayState.graphics;
     
-    display.init();
-    display.set_backlight(100);
+    st7789.set_backlight(100);
     
     sleep_ms(2000);
     printf("Starting...\n");
 
 #ifdef CAM_ON
     uint8_t fpsModeID = 0;
+    // ReSharper disable once CppDFAUnreachableCode
     switch(ThermalCameraFPS){
-    case 1:
+        case 1:
         fpsModeID = 0x01;
         break;
     case 2:
@@ -201,6 +229,7 @@ int main() {
     case 16:
         fpsModeID = 0x05;
         break;
+    // ReSharper disable once CppDFAUnreachableCode
     case 32:
         fpsModeID = 0x06;
         break;
@@ -208,45 +237,45 @@ int main() {
         fpsModeID = 0x07;
         break;
     default:
-        CrashWithError("Unsupported FPS value", 0);
+        CrashWithError(displayState, "Unsupported FPS value", 0);
     }
     
     const int fpsModeResult = MLX90640_SetRefreshRate(ThermalCameraI2CAddress, fpsModeID);
     if (fpsModeResult != 0) {
-        CrashWithError("Failed to set the camera refresh rate", fpsModeResult);
+        CrashWithError(displayState, "Failed to set the camera refresh rate", fpsModeResult);
     }
-    
+
     const int chessModeResult = MLX90640_SetChessMode(ThermalCameraI2CAddress);
     if (chessModeResult != 0) {
-        CrashWithError("Failed to set the camera to chess mode", chessModeResult);
+        CrashWithError(displayState, "Failed to set the camera to chess mode", chessModeResult);
     }
     
     const int eeDumpResult = MLX90640_DumpEE(ThermalCameraI2CAddress, cameraEEPROMData.data());
     if (eeDumpResult != 0) {
-        CrashWithError("Failed to dump camera eeprom data", eeDumpResult);
+        CrashWithError(displayState, "Failed to dump camera eeprom data", eeDumpResult);
     }
     
-    uint16_t hey = 64;
-    printf("HEY: %d\n\n", hey);
-    for (size_t b = 0; b < cameraFrameData.size(); ++b) {
-        //printf("0x%04d ", cameraFrameData[b]);
-        printf("%d", cameraFrameData[b]);
-        
-        if ((b + 1) % 8 == 0) {
-            printf("\n");
-        }
-    }
+    // uint16_t hey = 64;
+    // printf("HEY: %d\n\n", hey);
+    // for (size_t b = 0; b < cameraFrameData.size(); ++b) {
+    //     //printf("0x%04d ", cameraFrameData[b]);
+    //     printf("%d", cameraFrameData[b]);
+    //     
+    //     if ((b + 1) % 8 == 0) {
+    //         printf("\n");
+    //     }
+    // }
     
     paramsMLX90640 mlx90640Params;
     const int paramExtractResult = MLX90640_ExtractParameters(cameraEEPROMData.data(), &mlx90640Params);
     if (paramExtractResult != 0) {
-        CrashWithError("Problems when parsing camera eeprom data", paramExtractResult);
+        CrashWithError(displayState, "Problems when parsing camera eeprom data", paramExtractResult);
     }
 #endif // CAM_ON
 
-    const Pen textColor = display.create_pen(0, 255, 0);
-    const Pen whitePen = display.create_pen(255, 255, 255);
-    const Pen blackPen = display.create_pen(  0,   0,   0);
+    const Pen textColor = graphics.create_pen(0, 255, 0);
+    const Pen whitePen = graphics.create_pen(255, 255, 255);
+    const Pen blackPen = graphics.create_pen(  0,   0,   0);
     
     int64_t lastSleepDuration = 0;
     uint64_t iter = 0;
@@ -256,48 +285,43 @@ int main() {
     bool aPressed = false;
     bool bPressed = false;
     
-    bool xPressedLastTime = false;
-    bool yPressedLastTime = false;
-    bool aPressedLastTime = false;
-    bool bPressedLastTime = false;
-    
     absolute_time_t previous = get_absolute_time();
     while (true) {
         const absolute_time_t start = get_absolute_time();
         const int64_t deltaFrame = absolute_time_diff_us(start, previous);
         previous = start;
         
-        xPressed = display.is_pressed(PicoDisplay::X);
-        yPressed = display.is_pressed(PicoDisplay::Y);
-        aPressed = display.is_pressed(PicoDisplay::A);
-        bPressed = display.is_pressed(PicoDisplay::B);
+        xPressed = displayState.buttonX.read();
+        yPressed = displayState.buttonY.read();
+        aPressed = displayState.buttonA.read();
+        bPressed = displayState.buttonB.read();
         
-        display.set_pen(120, 40, 60);
-        display.clear();
+        graphics.set_pen(120, 40, 60);
+        graphics.clear();
         
         const uint16_t rawADC = adc_read();
         const float voltage = static_cast<float>(rawADC) * BatteryConversionFactor;
         
-        display.set_pen(textColor);
+        graphics.set_pen(textColor);
         
         std::stringstream ss;
         ss << std::fixed << std::setprecision(3) << voltage << "V";
         iter++;
         
         const std::string voltageStr = ss.str();
-        display.text(voltageStr, BatteryTextOrigin, 255, 1);
+        graphics.text(voltageStr, BatteryTextOrigin, 255, 1);
         
         if (gpio_get(USBConnectedPin)) {
-            display.text(UsbConnectedTxt, USBTextOrigin, 255, 1);
+            graphics.text(UsbConnectedTxt, USBTextOrigin, 255, 1);
         } else {
-            display.text(UsbDiconnectedTxt, USBTextOrigin, 255, 1);
+            graphics.text(UsbDiconnectedTxt, USBTextOrigin, 255, 1);
         }
         
 #ifdef CAM_ON
         const int frameDataFetchResult = MLX90640_GetFrameData(ThermalCameraI2CAddress, cameraFrameData.data());
         if (frameDataFetchResult < 0) {
-            display.update();
-            CrashWithError("Failed to get the frame data", frameDataFetchResult);
+            st7789.update(&graphics);
+            CrashWithError(displayState, "Failed to get the frame data", frameDataFetchResult);
         }
 
         const float ta = MLX90640_GetTa(cameraFrameData.data(), &mlx90640Params);
@@ -316,25 +340,25 @@ int main() {
         
         if (!(aPressed && bPressed)) {
             if (aPressed && xPressed) {
-                heatmapMin += HeatmapDeltaMultiplier * deltaFrame;
+                heatmapMin += HeatmapDeltaMultiplier * static_cast<float>(deltaFrame);
             } else if (aPressed && yPressed) {
-                heatmapMin -= HeatmapDeltaMultiplier * deltaFrame;
+                heatmapMin -= HeatmapDeltaMultiplier * static_cast<float>(deltaFrame);
             }
             
             if (bPressed && xPressed) {
-                heatmapMax += HeatmapDeltaMultiplier * deltaFrame;
+                heatmapMax += HeatmapDeltaMultiplier * static_cast<float>(deltaFrame);
             } else if (bPressed && yPressed) {
-                heatmapMax -= HeatmapDeltaMultiplier * deltaFrame;
+                heatmapMax -= HeatmapDeltaMultiplier * static_cast<float>(deltaFrame);
             }
         }
         
         float temperatureSum = 0.0f;
-        for (size_t x = 0; x < TemperatureSensorWidth; ++x) {
-            for (size_t y = 0; y < TemperatureSensorHeight; ++y) {
+        for (int32_t x = 0; x < TemperatureSensorWidth; ++x) {
+            for (int32_t y = 0; y < TemperatureSensorHeight; ++y) {
                 float value = finalTemperatureData[TemperatureSensorHeight * (TemperatureSensorWidth - 1 - x) + y];
                 temperatureSum += value;
                 
-                const size_t outputX = TemperatureSensorWidth - 1 - x;
+                const int32_t outputX = TemperatureSensorWidth - 1 - x;
                 
                 if (value < minTemp) {
                     minTemp = value;
@@ -346,17 +370,18 @@ int main() {
                     maxTempPixel = Point(outputX, y);
                 }
                 
-                const Color color = TemperatureToHeatmap(value, heatmapRange, display);
-                heatmapPixels[y * TemperatureSensorWidth + outputX] = display.create_pen(color.r, color.g, color.b);
+                const Color color = TemperatureToHeatmap(value, heatmapRange);
+                heatmapPixels[y * TemperatureSensorWidth + outputX] = graphics.create_pen(color.r, color.g, color.b);
             }
         }
         
         const float temperatureAverage = temperatureSum / FinalTemperatureDataSize;
-        const Color avgColor = TemperatureToHeatmap(temperatureAverage, heatmapRange, display);
+        const Color avgColor = TemperatureToHeatmap(temperatureAverage, heatmapRange);
         
         // Full brightness LED is blinding in a dark room and makes looking at the screen painful
         constexpr uint8_t brightnessDivisor = 3;
-        display.set_led(avgColor.r / brightnessDivisor, avgColor.g / brightnessDivisor, avgColor.b / brightnessDivisor);
+        displayState.led.set_rgb(avgColor.r / brightnessDivisor, avgColor.g / brightnessDivisor, avgColor.b / brightnessDivisor);
+        displayState.led.set_brightness(128);
         
         if (xPressed && !(aPressed || bPressed)) {
             heatmapPixels[minTempPixel.y * TemperatureSensorWidth + minTempPixel.x] = whitePen;
@@ -372,73 +397,66 @@ int main() {
                 const Pen p = heatmapPixels[y * TemperatureSensorWidth + x];
                 
                 for (int32_t r = 0; r < NearestScaleMult; ++r) {
-                    display.set_pen(p);
-                    display.pixel_span(Point(x * NearestScaleMult, (y * NearestScaleMult) + HeatmapTopOffsetPixels + r), NearestScaleMult);
+                    graphics.set_pen(p);
+                    graphics.pixel_span(Point(x * NearestScaleMult, (y * NearestScaleMult) + HeatmapTopOffsetPixels + r), NearestScaleMult);
                 }
             }
         }
         
-        display.set_pen(textColor);
+        graphics.set_pen(textColor);
         int32_t infoYOffset = USBTextOrigin.y + TextLineHeight * 2;
         
         char minValText[64];
         sprintf(minValText, "Min: %.2fC", minTemp);
-        display.text(minValText, Point(TextXOffset, infoYOffset), 255, 1);
+        graphics.text(minValText, Point(TextXOffset, infoYOffset), 255, 1);
         infoYOffset += TextLineHeight;
         
         char minValTextPixel[64];
         sprintf(minValTextPixel, "Min Pixel: %d %d", minTempPixel.x, minTempPixel.y);
-        display.text(minValTextPixel, Point(TextXOffset, infoYOffset), 255, 1);
+        graphics.text(minValTextPixel, Point(TextXOffset, infoYOffset), 255, 1);
         infoYOffset += TextLineHeight;
-        display.text(HoldX, Point(TextXOffset, infoYOffset), 255, 1);
+        graphics.text(HoldX, Point(TextXOffset, infoYOffset), 255, 1);
         infoYOffset += TextLineHeight * 2;
         
         char maxValText[64];
         sprintf(maxValText, "MAX: %.2fC", maxTemp);
-        display.text(maxValText, Point(TextXOffset, infoYOffset), 255, 1);
+        graphics.text(maxValText, Point(TextXOffset, infoYOffset), 255, 1);
         infoYOffset += TextLineHeight;
         
         char maxValTextPixel[64];
         sprintf(maxValTextPixel, "Max Pixel: %d %d", maxTempPixel.x, maxTempPixel.y);
-        display.text(maxValTextPixel, Point(TextXOffset, infoYOffset), 255, 1);
+        graphics.text(maxValTextPixel, Point(TextXOffset, infoYOffset), 255, 1);
         infoYOffset += TextLineHeight;
-        display.text(HoldY, Point(TextXOffset, infoYOffset), 255, 1);
+        graphics.text(HoldY, Point(TextXOffset, infoYOffset), 255, 1);
         infoYOffset += TextLineHeight * 2;
         
         char avgText[64];
-        sprintf(avgText, "Avgerage (LED): %.2fC", temperatureAverage);
-        display.text(avgText, Point(TextXOffset, infoYOffset), 255, 1);
+        sprintf(avgText, "Average (LED): %.2fC", temperatureAverage);
+        graphics.text(avgText, Point(TextXOffset, infoYOffset), 255, 1);
         infoYOffset += TextLineHeight * 2;
         
         char heatmapMinText[64];
         sprintf(heatmapMinText, "Heatmap Min: %.2f", heatmapMin);
-        display.text(heatmapMinText, Point(TextXOffset, infoYOffset), 255, 1);
+        graphics.text(heatmapMinText, Point(TextXOffset, infoYOffset), 255, 1);
         infoYOffset += TextLineHeight;
-        display.text(PressA, Point(TextXOffset, infoYOffset), 255, 1);
+        graphics.text(PressA, Point(TextXOffset, infoYOffset), 255, 1);
         infoYOffset += TextLineHeight * 2;
         
         char heatmapMaxText[64];
         sprintf(heatmapMaxText, "Heatmap Max: %.2f", heatmapMax);
-        display.text(heatmapMaxText, Point(TextXOffset, infoYOffset), 255, 1);
+        graphics.text(heatmapMaxText, Point(TextXOffset, infoYOffset), 255, 1);
         infoYOffset += TextLineHeight;
-        display.text(PressB, Point(TextXOffset, infoYOffset), 255, 1);
-        infoYOffset += TextLineHeight * 2;
+        graphics.text(PressB, Point(TextXOffset, infoYOffset), 255, 1);
+        // infoYOffset += TextLineHeight * 2;
 #endif // CAM_ON
 
-        display.update();
-        
-        xPressedLastTime = xPressed;
-        yPressedLastTime = yPressed;
-        aPressedLastTime = aPressed;
-        bPressedLastTime = bPressed;
+        st7789.update(&graphics);
         
         const absolute_time_t end = get_absolute_time();
         const int64_t durationDeltaUs = absolute_time_diff_us(start, end);
         lastSleepDuration = ThermalCameraFrameDurationUs - durationDeltaUs;
         if (lastSleepDuration > 0) {
             sleep_us(lastSleepDuration);
-        } else {
-            lastSleepDuration = 0;
         }
     }
 }
